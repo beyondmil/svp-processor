@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SVP Data Processor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <script type="text/babel">
+        import React, { useState } from 'react';
+        import { Upload, Download, Calendar } from 'lucide-react';
+        import * as XLSX from 'xlsx';
+
+        const SVPDataProcessor = () => {
+          const [inputMethod, setInputMethod] = useState('manual'); // 'manual', 'batch', or 'upload'
+          const [batchData, setBatchData] = useState('');
+          const [batchDelimiter, setBatchDelimiter] = useState('tab');
+          const [velocitySource, setVelocitySource] = useState('sound'); // 'sound' or 'calculated'
+          const [manualParse, setManualParse] = useState(false);
+          const [noCalculatedSOS, setNoCalculatedSOS] = useState(false);
+          const [columnMapping, setColumnMapping] = useState({
+            depth: '2',
+            temperature: '3',
+            velocity: '1'
+          });
+          const [detectedHeaders, setDetectedHeaders] = useState([]);
+          const [fileContent, setFileContent] = useState('');
+          const [formData, setFormData] = useState({
+            jobNo: '',
+            project: '',
+            client: '',
+            dateTime: '',
+            area: '',
+            location: '',
+            vessel: '',
+            instrument: ''
+          });
+          
+          const [manualData, setManualData] = useState([
+            { depth: '', temperature: '', velocity: '', depthUnit: 'm', tempUnit: 'C', velUnit: 'm/s' }
+          ]);
+          
+          const [uploadedFile, setUploadedFile] = useState(null);
+
+          // Unit conversion functions
+          const convertDepth = (value, fromUnit) => {
+            const conversions = {
+              'm': 1,
+              'ft': 0.3048,
+              'fathom': 1.8288
+            };
+            return parseFloat(value) * conversions[fromUnit];
+          };
+
+          const convertTemperature = (value, fromUnit) => {
+            const val = parseFloat(value);
+            if (fromUnit === 'C') return val;
+            if (fromUnit === 'F') return (val - 32) * 5/9;
+            if (fromUnit === 'K') return val - 273.15;
+            return val;
+          };
+
+          const convertVelocity = (value, fromUnit) => {
+            const conversions = {
+              'm/s': 1,
+              'ft/s': 0.3048,
+              'km/h': 0.277778,
+              'knots': 0.514444
+            };
+            return parseFloat(value) * conversions[fromUnit];
+          };
+
+          const addDataRow = () => {
+            setManualData([...manualData, { 
+              depth: '', 
+              temperature: '', 
+              velocity: '', 
+              depthUnit: 'm', 
+              tempUnit: 'C', 
+              velUnit: 'm/s' 
+            }]);
+          };
+
+          const removeDataRow = (index) => {
+            if (manualData.length > 1) {
+              setManualData(manualData.filter((_, i) => i !== index));
+            }
+          };
+
+          const updateManualData = (index, field, value) => {
+            const newData = [...manualData];
+            newData[index][field] = value;
+            setManualData(newData);
+          };
+
+          const handleFileUpload = (event) => {
+            const file = event.target.files[0];
+            if (file) {
+              setUploadedFile(file);
+              const reader = new FileReader();
+              reader.onload = (e) => {
+                const text = e.target.result;
+                setFileContent(text);
+                
+                // Detect if it's instrument raw data or simple CSV/TXT
+                const hasMultipleColumns = text.split('\n').some(line => {
+                  const parts = line.split('\t');
+                  return parts.length >= 4;
+                });
+                
+                if (hasMultipleColumns) {
+                  // Instrument raw data
+                  const parsed = parseInstrumentData(
+                    text, 
+                    velocitySource, 
+                    manualParse ? columnMapping : null
+                  );
+                  
+                  if (parsed.length > 0) {
+                    alert(`Parsed ${parsed.length} valid data points from instrument file`);
+                    const converted = parsed.map(row => ({
+                      depth: row.depth.toString(),
+                      temperature: row.temperature.toString(),
+                      velocity: row.velocity.toString(),
+                      depthUnit: 'm',
+                      tempUnit: 'C',
+                      velUnit: 'm/s'
+                    }));
+                    setManualData(converted);
+                  } else {
+                    alert('No valid data found. Try enabling Manual Parse and setting column numbers.');
+                  }
+                } else {
+                  // Simple batch data
+                  const parsed = parseBatchData(text, batchDelimiter);
+                  if (parsed.length > 0) {
+                    const converted = parsed.map(row => ({
+                      depth: row.depth.toString(),
+                      temperature: row.temperature.toString(),
+                      velocity: row.velocity.toString(),
+                      depthUnit: 'm',
+                      tempUnit: 'C',
+                      velUnit: 'm/s'
+                    }));
+                    setManualData(converted);
+                  }
+                }
+              };
+              reader.readAsText(file);
+            }
+          };
+
+          const reprocessFile = () => {
+            if (!fileContent) return;
+            
+            const parsed = parseInstrumentData(
+              fileContent, 
+              velocitySource, 
+              manualParse ? columnMapping : null
+            );
+            
+            if (parsed.length > 0) {
+              alert(`Re-parsed ${parsed.length} valid data points`);
+              const converted = parsed.map(row => ({
+                depth: row.depth.toString(),
+                temperature: row.temperature.toString(),
+                velocity: row.velocity.toString(),
+                depthUnit: 'm',
+                tempUnit: 'C',
+                velUnit: 'm/s'
+              }));
+              setManualData(converted);
+            } else {
+              alert('No valid data found with current settings.');
+            }
+          };
+
+          const parseBatchData = (text, delimiter = 'tab') => {
+            const lines = text.trim().split('\n').filter(line => line.trim());
+            
+            // Determine delimiter pattern
+            let delimiterPattern;
+            switch(delimiter) {
+              case 'comma':
+                delimiterPattern = /,/;
+                break;
+              case 'semicolon':
+                delimiterPattern = /;/;
+                break;
+              case 'dash':
+                delimiterPattern = /-/;
+                break;
+              case 'underscore':
+                delimiterPattern = /_/;
+                break;
+              case 'tab':
+              default:
+                delimiterPattern = /[\t\s]+/;
+                break;
+            }
+            
+            const parsed = lines.map(line => {
+              const parts = line.split(delimiterPattern).filter(p => p.trim());
+              if (parts.length >= 3) {
+                return {
+                  depth: parseFloat(parts[0]),
+                  temperature: parseFloat(parts[1]),
+                  velocity: parseFloat(parts[2])
+                };
+              }
+              return null;
+            }).filter(row => row !== null && !isNaN(row.depth) && !isNaN(row.temperature) && !isNaN(row.velocity));
+            
+            return parsed;
+          };
+
+          const findDataStartLine = (lines) => {
+            // Find the line where consistent tabular data starts
+            // Look for lines with at least 4 tab-separated numeric columns
+            
+            for (let i = 0; i < lines.length - 10; i++) {
+              const line = lines[i];
+              const parts = line.split('\t').filter(p => p.trim());
+              
+              // Check if this line has at least 4 columns
+              if (parts.length >= 4) {
+                // Check if the next 5 lines also have consistent column count
+                let consistentCount = 0;
+                const expectedColumns = parts.length;
+                
+                for (let j = i + 1; j < i + 6 && j < lines.length; j++) {
+                  const nextParts = lines[j].split('\t').filter(p => p.trim());
+                  if (nextParts.length === expectedColumns) {
+                    // Check if at least 3 columns contain numeric data
+                    const numericCols = nextParts.filter(p => !isNaN(parseFloat(p))).length;
+                    if (numericCols >= 3) {
+                      consistentCount++;
+                    }
+                  }
+                }
+                
+                // If at least 4 out of 5 next lines are consistent, this is likely the data start
+                if (consistentCount >= 4) {
+                  // Check if this looks like a header line (contains letters)
+                  const hasLetters = /[a-zA-Z]/.test(line);
+                  if (hasLetters) {
+                    // This is the header, data starts next line
+                    return i;
+                  } else {
+                    // No header, data starts here, but we'll treat previous line as potential header
+                    return Math.max(0, i - 1);
+                  }
+                }
+              }
+            }
+            
+            return -1;
+          };
+
+          const parseInstrumentData = (text, velocityType = 'sound', manualColumns = null) => {
+            const lines = text.split('\n');
+            
+            // Find where data actually starts
+            const dataStartIndex = findDataStartLine(lines);
+            
+            if (dataStartIndex === -1) {
+              alert('Could not detect data section. Please enable Manual Parse.');
+              return [];
+            }
+            
+            // Check if line at dataStartIndex is a header
+            const headerLine = lines[dataStartIndex];
+            const isHeader = /[a-zA-Z]/.test(headerLine);
+            
+            const headers = isHeader ? headerLine.split('\t').map(h => h.trim()) : [];
+            setDetectedHeaders(headers);
+            
+            const actualDataStart = isHeader ? dataStartIndex + 1 : dataStartIndex;
+            
+            // Determine column indices
+            let depthCol, tempCol, velCol;
+            
+            if (manualColumns) {
+              // Use manual column mapping
+              depthCol = parseInt(manualColumns.depth);
+              tempCol = parseInt(manualColumns.temperature);
+              velCol = parseInt(manualColumns.velocity);
+            } else if (headers.length > 0) {
+              // Auto-detect from headers
+              depthCol = headers.findIndex(h => 
+                h.toLowerCase().includes('pressure') || h.toLowerCase().includes('depth')
+              );
+              tempCol = headers.findIndex(h => 
+                h.toLowerCase().includes('temperature') || h.toLowerCase().includes('temp')
+              );
+              
+              if (velocityType === 'sound') {
+                velCol = headers.findIndex(h => 
+                  h.toLowerCase().includes('sound velocity') || 
+                  (h.toLowerCase().includes('velocity') && !h.toLowerCase().includes('calc'))
+                );
+              } else {
+                velCol = headers.findIndex(h => 
+                  h.toLowerCase().includes('calc') && h.toLowerCase().includes('sos')
+                );
+              }
+              
+              // Fallback to common positions if not found
+              if (depthCol === -1) depthCol = 2;
+              if (tempCol === -1) tempCol = 3;
+              if (velCol === -1) velCol = velocityType === 'sound' ? 1 : 7;
+            } else {
+              // No headers, use default positions
+              depthCol = 2;
+              tempCol = 3;
+              velCol = 1;
+            }
+            
+            // Parse data lines
+            const dataLines = lines.slice(actualDataStart).filter(line => line.trim());
+            
+            const allData = dataLines.map(line => {
+              const parts = line.split('\t').map(p => p.trim());
+              if (parts.length >= Math.max(depthCol, tempCol, velCol) + 1) {
+                const depth = parseFloat(parts[depthCol]);
+                const temperature = parseFloat(parts[tempCol]);
+                const velocity = parseFloat(parts[velCol]);
+                
+                return {
+                  timestamp: parts[0] || '',
+                  depth,
+                  temperature,
+                  velocity
+                };
+              }
+              return null;
+            }).filter(row => row !== null && !isNaN(row.depth) && !isNaN(row.temperature) && !isNaN(row.velocity));
+            
+            // Filter for consistent ascending/descending data
+            return filterConsistentDepthData(allData);
+          };
+
+          const filterConsistentDepthData = (data) => {
+            if (data.length === 0) return [];
+            
+            // Find where consistent ascending starts
+            let startIndex = 0;
+            const threshold = 0.5; // minimum depth increase to consider as ascending
+            
+            for (let i = 0; i < data.length - 5; i++) {
+              // Check if next 5 points show consistent increase
+              let isConsistentAscending = true;
+              for (let j = i; j < i + 4 && j < data.length - 1; j++) {
+                if (data[j + 1].depth <= data[j].depth + threshold) {
+                  isConsistentAscending = false;
+                  break;
+                }
+              }
+              
+              if (isConsistentAscending) {
+                startIndex = i;
+                break;
+              }
+            }
+            
+            // Find the peak (maximum depth)
+            let peakIndex = startIndex;
+            let maxDepth = data[startIndex].depth;
+            
+            for (let i = startIndex + 1; i < data.length; i++) {
+              if (data[i].depth > maxDepth) {
+                maxDepth = data[i].depth;
+                peakIndex = i;
+              }
+            }
+            
+            // Find where consistent descending ends
+            let endIndex = data.length - 1;
+            
+            for (let i = data.length - 1; i > peakIndex + 5; i--) {
+              // Check if previous 5 points show consistent decrease
+              let isConsistentDescending = true;
+              for (let j = i; j > i - 4 && j > peakIndex; j--) {
+                if (data[j - 1].depth <= data[j].depth - threshold) {
+                  isConsistentDescending = false;
+                  break;
+                }
+              }
+              
+              if (isConsistentDescending) {
+                endIndex = i;
+                break;
+              }
+            }
+            
+            // Return filtered data from start to end
+            return data.slice(startIndex, endIndex + 1).map(row => ({
+              depth: row.depth,
+              temperature: row.temperature,
+              velocity: row.velocity
+            }));
+          };
+
+          const detectDownwardUpward = (data) => {
+            if (data.length === 0) return { downward: [], upward: [] };
+            
+            // Find the turning point where depth changes from ascending to descending
+            let turningPoint = 0;
+            
+            for (let i = 0; i < data.length - 1; i++) {
+              // Check if next depth is less than current (start of upward/ascending back)
+              if (data[i + 1].depth < data[i].depth) {
+                turningPoint = i;
+                break;
+              }
+            }
+            
+            // If no turning point found, all data is downward
+            if (turningPoint === 0 && data.length > 1 && data[1].depth >= data[0].depth) {
+              turningPoint = data.length - 1;
+            }
+            
+            const downward = data.slice(0, turningPoint + 1);
+            const upward = data.slice(turningPoint + 1);
+            
+            return { downward, upward };
+          };
+
+          const separateDownwardUpward = (data) => {
+            // For manual entry with units, convert to standard units first
+            if (data[0].depthUnit) {
+              const convertedData = data.map(row => ({
+                depth: convertDepth(row.depth, row.depthUnit),
+                temperature: convertTemperature(row.temperature, row.tempUnit),
+                velocity: convertVelocity(row.velocity, row.velUnit)
+              }));
+              return detectDownwardUpward(convertedData);
+            }
+            
+            // For batch/upload data that's already in standard format
+            return detectDownwardUpward(data);
+          };
+
+          const generateExcel = async () => {
+            try {
+              let validData = [];
+              
+              // Handle different input methods
+              if (inputMethod === 'batch') {
+                validData = parseBatchData(batchData, batchDelimiter);
+                if (validData.length === 0) {
+                  alert('Please enter valid batch data');
+                  return;
+                }
+              } else {
+                // Filter out empty rows for manual/upload
+                validData = manualData.filter(row => 
+                  row.depth && row.temperature && row.velocity
+                );
+
+                if (validData.length === 0) {
+                  alert('Please enter at least one complete data row');
+                  return;
+                }
+              }
+
+              // Separate downward and upward data
+              const { downward, upward } = separateDownwardUpward(validData);
+
+              // Fetch the template from GitHub
+              alert('Fetching template from GitHub...');
+              const templateUrl = 'https://raw.githubusercontent.com/beyondmil/svp-processor/main/public/templates/SVP_Report_Landscape.xlsx';
+              
+              const response = await fetch(templateUrl);
+              if (!response.ok) {
+                throw new Error('Failed to fetch template');
+              }
+              
+              const arrayBuffer = await response.arrayBuffer();
+              const workbook = XLSX.read(arrayBuffer, { type: 'array', cellStyles: true });
+
+              // Insert data into SVP sheet
+              const svpSheet = workbook.Sheets['SVP'];
+              
+              // Insert header information into SVP sheet
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.jobNo ? `: ${formData.jobNo}` : '']
+              ], { origin: 'B1' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.project ? `: ${formData.project}` : '']
+              ], { origin: 'B2' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.client ? `: ${formData.client}` : '']
+              ], { origin: 'B3' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.dateTime ? `: ${formData.dateTime}` : '']
+              ], { origin: 'B4' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.area ? `: ${formData.area}` : '']
+              ], { origin: 'E1' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.location ? `: ${formData.location}` : '']
+              ], { origin: 'E2' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.vessel ? `: ${formData.vessel}` : '']
+              ], { origin: 'E3' });
+              XLSX.utils.sheet_add_aoa(svpSheet, [
+                [formData.instrument ? `: ${formData.instrument}` : '']
+              ], { origin: 'E4' });
+
+              // Ensure we have enough rows (extend if needed)
+              const maxRows = Math.max(downward.length, upward.length);
+              const requiredRows = 7 + maxRows; // 7 header rows + data rows
+              
+              // Insert downward data (columns A, B, C starting from row 8)
+              const downwardData = downward.map(row => [
+                parseFloat(row.depth).toFixed(2),
+                parseFloat(row.temperature).toFixed(2),
+                parseFloat(row.velocity).toFixed(2)
+              ]);
+              XLSX.utils.sheet_add_aoa(svpSheet, downwardData, { origin: 'A8' });
+
+              // Insert upward data (columns D, E, F starting from row 8)
+              const upwardData = upward.map(row => [
+                parseFloat(row.depth).toFixed(2),
+                parseFloat(row.temperature).toFixed(2),
+                parseFloat(row.velocity).toFixed(2)
+              ]);
+              XLSX.utils.sheet_add_aoa(svpSheet, upwardData, { origin: 'D8' });
+
+              // Update formulas for the actual data range
+              const lastDataRow = 7 + maxRows;
+              
+              // Update formulas in row 47 (or last row + some offset)
+              const formulaRow = lastDataRow + 1;
+              
+              // AVERAGE formulas
+              svpSheet[`B${formulaRow}`] = { f: `AVERAGE(B8:B${lastDataRow})` };
+              svpSheet[`C${formulaRow}`] = { f: `AVERAGE(C8:C${lastDataRow})` };
+              svpSheet[`E${formulaRow}`] = { f: `AVERAGE(E8:E${lastDataRow})` };
+              svpSheet[`F${formulaRow}`] = { f: `AVERAGE(F8:F${lastDataRow})` };
+              
+              // MIN formulas
+              svpSheet[`B${formulaRow + 1}`] = { f: `MIN(B8:B${lastDataRow})` };
+              svpSheet[`C${formulaRow + 1}`] = { f: `MIN(C8:C${lastDataRow})` };
+              svpSheet[`E${formulaRow + 1}`] = { f: `MIN(E8:E${lastDataRow})` };
+              svpSheet[`F${formulaRow + 1}`] = { f: `MIN(F8:F${lastDataRow})` };
+              
+              // MAX formulas
+              svpSheet[`B${formulaRow + 2}`] = { f: `MAX(B8:B${lastDataRow})` };
+              svpSheet[`C${formulaRow + 2}`] = { f: `MAX(C8:C${lastDataRow})` };
+              svpSheet[`E${formulaRow + 2}`] = { f: `MAX(E8:E${lastDataRow})` };
+              svpSheet[`F${formulaRow + 2}`] = { f: `MAX(F8:F${lastDataRow})` };
+              
+              // STDEV formulas
+              svpSheet[`B${formulaRow + 3}`] = { f: `STDEV(B8:B${lastDataRow})` };
+              svpSheet[`C${formulaRow + 3}`] = { f: `STDEV(C8:C${lastDataRow})` };
+              svpSheet[`E${formulaRow + 3}`] = { f: `STDEV(E8:E${lastDataRow})` };
+              svpSheet[`F${formulaRow + 3}`] = { f: `STDEV(F8:F${lastDataRow})` };
+              
+              // Overall average (merged cell C51 to F51 equivalent)
+              svpSheet[`C${formulaRow + 4}`] = { f: `AVERAGE(C${formulaRow},F${formulaRow})` };
+
+              // Insert ALL raw data into RAW sheet (no processing)
+              const rawSheet = workbook.Sheets['RAW'];
+              
+              // Insert ALL unprocessed data starting from A1
+              const allRawData = validData.map(row => [
+                row.depth,
+                row.temperature,
+                row.velocity
+              ]);
+              XLSX.utils.sheet_add_aoa(rawSheet, allRawData, { origin: 'A1' });
+
+              // Update sheet range to include all data
+              const svpRange = XLSX.utils.decode_range(svpSheet['!ref']);
+              svpRange.e.r = Math.max(svpRange.e.r, formulaRow + 4);
+              svpSheet['!ref'] = XLSX.utils.encode_range(svpRange);
+              
+              const rawRange = XLSX.utils.decode_range(rawSheet['!ref']);
+              rawRange.e.r = Math.max(rawRange.e.r, 7 + allRawData.length);
+              rawSheet['!ref'] = XLSX.utils.encode_range(rawRange);
+
+              // Generate and download file
+              XLSX.writeFile(workbook, `SVP_${formData.jobNo || 'Data'}_${new Date().toISOString().split('T')[0]}.xlsx`);
+              
+              alert('Excel file generated successfully with all formulas preserved!');
+            } catch (error) {
+              console.error('Error generating Excel:', error);
+              alert(`Error generating Excel file: ${error.message}. Make sure the template is accessible on GitHub.`);
+            }
+          };
+
+          return (
+            <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-6">
+              <div className="max-w-6xl mx-auto">
+                <div className="bg-white rounded-lg shadow-xl p-8">
+                  <h1 className="text-3xl font-bold text-indigo-900 mb-6">SVP Data Processor</h1>
+                  
+                  {/* Document Identity Section */}
+                  <div className="mb-8">
+                    <h2 className="text-xl font-semibold text-gray-800 mb-4">Document Identity</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Job No.</label>
+                          <input
+                            type="text"
+                            value={formData.jobNo}
+                            onChange={(e) => setFormData({...formData, jobNo: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Job Number"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Project</label>
+                          <input
+                            type="text"
+                            value={formData.project}
+                            onChange={(e) => setFormData({...formData, project: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Project Name"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Client</label>
+                          <input
+                            type="text"
+                            value={formData.client}
+                            onChange={(e) => setFormData({...formData, client: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Client Name"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Date/Time</label>
+                          <input
+                            type="datetime-local"
+                            value={formData.dateTime}
+                            onChange={(e) => setFormData({...formData, dateTime: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                          />
+                        </div>
+                      </div>
+                      
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Area</label>
+                          <input
+                            type="text"
+                            value={formData.area}
+                            onChange={(e) => setFormData({...formData, area: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Area"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Location</label>
+                          <input
+                            type="text"
+                            value={formData.location}
+                            onChange={(e) => setFormData({...formData, location: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Location"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Vessel</label>
+                          <input
+                            type="text"
+                            value={formData.vessel}
+                            onChange={(e) => setFormData({...formData, vessel: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Vessel Name"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Instrument</label>
+                          <input
+                            type="text"
+                            value={formData.instrument}
+                            onChange={(e) => setFormData({...formData, instrument: e.target.value})}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                            placeholder="Enter Instrument"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Data Input Method Selection */}
+                  <div className="mb-6">
+                    <h2 className="text-xl font-semibold text-gray-800 mb-4">Data Input Method</h2>
+                    <div className="flex gap-4">
+                      <button
+                        onClick={() => setInputMethod('manual')}
+                        className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition ${
+                          inputMethod === 'manual'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                      >
+                        Manual Entry
+                      </button>
+                      <button
+                        onClick={() => setInputMethod('batch')}
+                        className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition ${
+                          inputMethod === 'batch'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                      >
+                        Batch Entry
+                      </button>
+                      <button
+                        onClick={() => setInputMethod('upload')}
+                        className={`flex items-center gap-2 px-6 py-3 rounded-lg font-medium transition ${
+                          inputMethod === 'upload'
+                            ? 'bg-indigo-600 text-white'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                        }`}
+                      >
+                        <Upload size={20} />
+                        Upload File (CSV/TXT)
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Batch Data Entry */}
+                  {inputMethod === 'batch' && (
+                    <div className="mb-6">
+                      <h2 className="text-xl font-semibold text-gray-800 mb-4">Batch Data Entry</h2>
+                      
+                      {/* Delimiter Selection */}
+                      <div className="mb-4">
+                        <label className="block text-sm font-medium text-gray-700 mb-2">Select Delimiter</label>
+                        <select
+                          value={batchDelimiter}
+                          onChange={(e) => setBatchDelimiter(e.target.value)}
+                          className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                        >
+                          <option value="tab">Space or Tabs</option>
+                          <option value="comma">Comma (,)</option>
+                          <option value="semicolon">Semicolon (;)</option>
+                          <option value="dash">Dash (-)</option>
+                          <option value="underscore">Underscore (_)</option>
+                        </select>
+                      </div>
+                      
+                      <p className="text-gray-600 mb-3">
+                        Paste your data below. Each line should contain: <strong>Depth{batchDelimiter === 'tab' ? ' ' : batchDelimiter === 'comma' ? ',' : batchDelimiter === 'semicolon' ? ';' : batchDelimiter === 'dash' ? '-' : '_'}Temperature{batchDelimiter === 'tab' ? ' ' : batchDelimiter === 'comma' ? ',' : batchDelimiter === 'semicolon' ? ';' : batchDelimiter === 'dash' ? '-' : '_'}Velocity</strong>
+                      </p>
+                      <div className="bg-gray-50 p-3 rounded mb-3 text-sm text-gray-700 font-mono">
+                        Example:<br/>
+                        {batchDelimiter === 'comma' && '1.02,29.71,1542.66'}
+                        {batchDelimiter === 'semicolon' && '1.02;29.71;1542.66'}
+                        {batchDelimiter === 'dash' && '1.02-29.71-1542.66'}
+                        {batchDelimiter === 'underscore' && '1.02_29.71_1542.66'}
+                        {batchDelimiter === 'tab' && '1.02    29.71    1542.66'}<br/>
+                        {batchDelimiter === 'comma' && '2.02,29.71,1542.77'}
+                        {batchDelimiter === 'semicolon' && '2.02;29.71;1542.77'}
+                        {batchDelimiter === 'dash' && '2.02-29.71-1542.77'}
+                        {batchDelimiter === 'underscore' && '2.02_29.71_1542.77'}
+                        {batchDelimiter === 'tab' && '2.02    29.71    1542.77'}<br/>
+                        {batchDelimiter === 'comma' && '2.99,29.72,1542.81'}
+                        {batchDelimiter === 'semicolon' && '2.99;29.72;1542.81'}
+                        {batchDelimiter === 'dash' && '2.99-29.72-1542.81'}
+                        {batchDelimiter === 'underscore' && '2.99_29.72_1542.81'}
+                        {batchDelimiter === 'tab' && '2.99    29.72    1542.81'}
+                      </div>
+                      <textarea
+                        value={batchData}
+                        onChange={(e) => setBatchData(e.target.value)}
+                        className="w-full h-96 px-4 py-3 border border-gray-300 rounded-lg font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                        placeholder={`Paste your data here...${batchDelimiter === 'comma' ? '\n1.02,29.71,1542.66\n2.02,29.71,1542.77' : batchDelimiter === 'semicolon' ? '\n1.02;29.71;1542.66\n2.02;29.71;1542.77' : batchDelimiter === 'dash' ? '\n1.02-29.71-1542.66\n2.02-29.71-1542.77' : batchDelimiter === 'underscore' ? '\n1.02_29.71_1542.66\n2.02_29.71_1542.77' : '\n1.02\t29.71\t1542.66\n2.02\t29.71\t1542.77'}`}
+                      />
+                      <div className="mt-3 flex items-center gap-4 text-sm">
+                        <span className="text-gray-600">
+                          {batchData.trim() ? `${batchData.trim().split('\n').length} lines detected` : 'No data entered'}
+                        </span>
+                        {batchData.trim() && (
+                          <button
+                            onClick={() => {
+                              const parsed = parseBatchData(batchData, batchDelimiter);
+                              const { downward, upward } = detectDownwardUpward(parsed);
+                              alert(`Preview:\nDownward: ${downward.length} points\nUpward: ${upward.length} points\nTotal: ${parsed.length} points`);
+                            }}
+                            className="px-4 py-1 bg-blue-500 text-white rounded hover:bg-blue-600"
+                          >
+                            Preview Split
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Manual Data Entry */}
+                  {inputMethod === 'manual' && (
+                    <div className="mb-6">
+                      <h2 className="text-xl font-semibold text-gray-800 mb-4">SVP Data Entry</h2>
+                      <div className="overflow-x-auto">
+                        <table className="w-full border-collapse">
+                          <thead>
+                            <tr className="bg-indigo-100">
+                              <th className="border border-gray-300 px-3 py-2 text-left">#</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Depth</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Unit</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Temperature</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Unit</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Velocity</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Unit</th>
+                              <th className="border border-gray-300 px-3 py-2 text-left">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {manualData.map((row, index) => (
+                              <tr key={index} className="hover:bg-gray-50">
+                                <td className="border border-gray-300 px-3 py-2">{index + 1}</td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <input
+                                    type="number"
+                                    step="0.01"
+                                    value={row.depth}
+                                    onChange={(e) => updateManualData(index, 'depth', e.target.value)}
+                                    className="w-full px-2 py-1 border border-gray-300 rounded"
+                                    placeholder="0.00"
+                                  />
+                                </td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <select
+                                    value={row.depthUnit}
+                                    onChange={(e) => updateManualData(index, 'depthUnit', e.target.value)}
+                                    className="w-full px-2 py-1 border border-gray-300 rounded"
+                                  >
+                                    <option value="m">m</option>
+                                    <option value="ft">ft</option>
+                                    <option value="fathom">fathom</option>
+                                  </select>
+                                </td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <input
+                                    type="number"
+                                    step="0.01"
+                                    value={row.temperature}
+                                    onChange={(e) => updateManualData(index, 'temperature', e.target.value)}
+                                    className="w-full px-2 py-1 border border-gray-300 rounded"
+                                    placeholder="0.00"
+                                  />
+                                </td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <select
+                                    value={row.tempUnit}
+                                    onChange={(e) => updateManualData(index, 'tempUnit', e.target.value)}
+                                    className="w-full px-2 py-1 border border-gray-300 rounded"
+                                  >
+                                    <option value="C">°C</option>
+                                    <option value="F">°F</option>
+                                    <option value="K">K</option>
+                                  </select>
+                                </td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <input
+                                    type="number"
+                                    step="0.01"
+                                    value={row.velocity}
+                                    onChange={(e) => updateManualData(index, 'velocity', e.target.value)}
+                                    className="w-full px-2 py-1 border border-gray-300 rounded"
+                                    placeholder="0.00"
+                                  />
+                                </td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <select
+                                    value={row.velUnit}
+                                    onChange={(e) => updateManualData(index, 'velUnit', e.target.value)}
+                                    className="w-full px-2 py-1 border border-gray-300 rounded"
+                                  >
+                                    <option value="m/s">m/s</option>
+                                    <option value="ft/s">ft/s</option>
+                                    <option value="km/h">km/h</option>
+                                    <option value="knots">knots</option>
+                                  </select>
+                                </td>
+                                <td className="border border-gray-300 px-3 py-2">
+                                  <button
+                                    onClick={() => removeDataRow(index)}
+                                    className="px-3 py-1 bg-red-500 text-white rounded hover:bg-red-600 text-sm"
+                                    disabled={manualData.length === 1}
+                                  >
+                                    Remove
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                      <button
+                        onClick={addDataRow}
+                        className="mt-4 px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium"
+                      >
+                        + Add Row
+                      </button>
+                    </div>
+                  )}
+
+                  {/* File Upload */}
+                  {inputMethod === 'upload' && (
+                    <div className="mb-6">
+                      <h2 className="text-xl font-semibold text-gray-800 mb-4">Upload SVP Data File</h2>
+                      
+                      {/* Manual Parse Checkbox */}
+                      <div className="mb-4 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={manualParse}
+                            onChange={(e) => setManualParse(e.target.checked)}
+                            className="w-4 h-4"
+                          />
+                          <span className="font-medium text-gray-800">Enable Manual Parse</span>
+                        </label>
+                        <p className="text-xs text-gray-600 mt-1 ml-6">
+                          Check this if automatic column detection fails or headers don't match standard format
+                        </p>
+                      </div>
+
+                      {/* Manual Column Mapping */}
+                      {manualParse && (
+                        <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                          <h3 className="font-medium text-gray-800 mb-3">Manual Column Mapping</h3>
+                          <p className="text-sm text-gray-600 mb-3">
+                            Specify which column contains each data type (0-based index, e.g., first column = 0)
+                          </p>
+                          
+                          {detectedHeaders.length > 0 && (
+                            <div className="mb-3 p-2 bg-white rounded text-xs">
+                              <strong>Detected headers:</strong>
+                              <div className="mt-1 font-mono">
+                                {detectedHeaders.map((h, i) => (
+                                  <div key={i}>[{i}] {h}</div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                              <label className="block text-sm font-medium text-gray-700 mb-1">
+                                Depth Column Index
+                              </label>
+                              <input
+                                type="number"
+                                min="0"
+                                value={columnMapping.depth}
+                                onChange={(e) => setColumnMapping({...columnMapping, depth: e.target.value})}
+                                className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                placeholder="e.g., 2"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">Usually PRESSURE;M column</p>
+                            </div>
+                            
+                            <div>
+                              <label className="block text-sm font-medium text-gray-700 mb-1">
+                                Temperature Column Index
+                              </label>
+                              <input
+                                type="number"
+                                min="0"
+                                value={columnMapping.temperature}
+                                onChange={(e) => setColumnMapping({...columnMapping, temperature: e.target.value})}
+                                className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                placeholder="e.g., 3"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">Usually TEMPERATURE;C column</p>
+                            </div>
+                            
+                            <div>
+                              <label className="block text-sm font-medium text-gray-700 mb-1">
+                                Velocity Column Index
+                              </label>
+                              <input
+                                type="number"
+                                min="0"
+                                value={columnMapping.velocity}
+                                onChange={(e) => setColumnMapping({...columnMapping, velocity: e.target.value})}
+                                className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                                placeholder="e.g., 1"
+                              />
+                              <p className="text-xs text-gray-500 mt-1">Sound Velocity or Calc. SOS column</p>
+                            </div>
+                          </div>
+                          
+                          {/* No Calculated SOS option */}
+                          <div className="mt-4">
+                            <label className="flex items-center gap-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={noCalculatedSOS}
+                                onChange={(e) => {
+                                  setNoCalculatedSOS(e.target.checked);
+                                  if (e.target.checked) {
+                                    setVelocitySource('sound');
+                                  }
+                                }}
+                                className="w-4 h-4"
+                              />
+                              <span className="text-sm text-gray-700">
+                                File doesn't have Calculated SOS column (only use Sound Velocity)
+                              </span>
+                            </label>
+                          </div>
+                          
+                          {fileContent && (
+                            <button
+                              onClick={reprocessFile}
+                              className="mt-4 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+                            >
+                              Re-process File with New Settings
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      
+                      {/* Velocity Source Selection */}
+                      {!noCalculatedSOS && (
+                        <div className="mb-4 p-4 bg-blue-50 rounded-lg">
+                          <label className="block text-sm font-medium text-gray-700 mb-2">
+                            Velocity Data Source
+                          </label>
+                          <select
+                            value={velocitySource}
+                            onChange={(e) => setVelocitySource(e.target.value)}
+                            className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+                          >
+                            <option value="sound">Sound Velocity (SOUND VELOCITY;M/SEC)</option>
+                            <option value="calculated">Calculated Speed of Sound (Calc. SOS; M/SEC)</option>
+                          </select>
+                          <p className="text-xs text-gray-600 mt-2">
+                            Select which velocity column to use from the instrument data
+                          </p>
+                        </div>
+                      )}
+                      
+                      <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center">
+                        <Upload className="mx-auto mb-4 text-gray-400" size={48} />
+                        <p className="text-gray-600 mb-2"><strong>Two file formats supported:</strong></p>
+                        <div className="text-left max-w-2xl mx-auto mb-4 text-sm text-gray-700">
+                          <p className="mb-2"><strong>1. Instrument Raw Data (TXT/CSV):</strong></p>
+                          <ul className="list-disc ml-6 mb-3">
+                            <li>Automatically detects where data begins (skips metadata/calibration sections)</li>
+                            <li>Filters out inconsistent depth measurements at surface</li>
+                            <li>Keeps only consistently ascending/descending profile data</li>
+                            <li>If auto-detection fails, enable "Manual Parse" to specify columns</li>
+                          </ul>
+                          <p className="mb-2"><strong>2. Simple Data (CSV/TXT):</strong></p>
+                          <ul className="list-disc ml-6">
+                            <li>Format: Depth, Temperature, Velocity (one row per line)</li>
+                            <li>Tab or comma separated values</li>
+                          </ul>
+                        </div>
+                        <input
+                          type="file"
+                          accept=".csv,.txt"
+                          onChange={handleFileUpload}
+                          className="hidden"
+                          id="file-upload"
+                        />
+                        <label
+                          htmlFor="file-upload"
+                          className="inline-block px-6 py-3 bg-indigo-600 text-white rounded-lg cursor-pointer hover:bg-indigo-700 font-medium"
+                        >
+                          Choose File
+                        </label>
+                        {uploadedFile && (
+                          <div className="mt-4">
+                            <p className="text-green-600 font-medium">✓ File uploaded: {uploadedFile.name}</p>
+                            {manualData.length > 0 && (
+                              <p className="text-sm text-gray-600 mt-1">
+                                Loaded {manualData.length} data points
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Generate Button */}
+                  <div className="flex justify-center">
+                    <button
+                      onClick={generateExcel}
+                      className="flex items-center gap-2 px-8 py-4 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 font-bold text-lg shadow-lg"
+                    >
+                      <Download size={24} />
+                      Generate Excel File
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        };
+
+        export default SVPDataProcessor;
+    </script>
+</body>
+</html>
