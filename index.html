@@ -465,7 +465,7 @@
             return detectDownwardUpward(data);
           };
 
-          const generateExcel = async () => {
+const generateExcel = async () => {
             try {
               let validData = [];
               
@@ -490,6 +490,7 @@
 
               // Separate downward and upward data
               const { downward, upward } = separateDownwardUpward(validData);
+              const maxRows = Math.max(downward.length, upward.length);
 
               // Fetch the template from GitHub
               alert('Fetching template from GitHub...');
@@ -501,114 +502,184 @@
               }
               
               const arrayBuffer = await response.arrayBuffer();
-              const workbook = XLSX.read(arrayBuffer, { type: 'array', cellStyles: true });
+              const workbook = XLSX.read(arrayBuffer, { type: 'array', cellStyles: true, cellFormula: true });
 
-              // Insert data into SVP sheet
+              // Get SVP sheet
               const svpSheet = workbook.Sheets['SVP'];
               
-              // Insert header information into SVP sheet
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.jobNo ? `: ${formData.jobNo}` : '']
-              ], { origin: 'B1' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.project ? `: ${formData.project}` : '']
-              ], { origin: 'B2' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.client ? `: ${formData.client}` : '']
-              ], { origin: 'B3' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.dateTime ? `: ${formData.dateTime}` : '']
-              ], { origin: 'B4' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.area ? `: ${formData.area}` : '']
-              ], { origin: 'E1' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.location ? `: ${formData.location}` : '']
-              ], { origin: 'E2' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.vessel ? `: ${formData.vessel}` : '']
-              ], { origin: 'E3' });
-              XLSX.utils.sheet_add_aoa(svpSheet, [
-                [formData.instrument ? `: ${formData.instrument}` : '']
-              ], { origin: 'E4' });
-
-              // Ensure we have enough rows (extend if needed)
-              const maxRows = Math.max(downward.length, upward.length);
-              const requiredRows = 7 + maxRows; // 7 header rows + data rows
+              // DATA INSERTION LOGIC:
+              const TEMPLATE_DATA_START = 8;
+              const TEMPLATE_DATA_END = 46;
+              const TEMPLATE_DATA_ROWS = 39; // 46 - 8 + 1
+              const FORMULA_START_ROW = 47;
               
+              // Calculate if we need to insert additional rows
+              const rowsNeeded = maxRows - TEMPLATE_DATA_ROWS;
+              
+              if (rowsNeeded > 0) {
+                // We need to insert rows at row 37 (10 rows before the end of data section)
+                const insertionPoint = 37;
+                
+                // Shift all cells from row 37 downwards by rowsNeeded
+                const range = XLSX.utils.decode_range(svpSheet['!ref']);
+                
+                // Create a new cells object with shifted rows
+                const newCells = {};
+                Object.keys(svpSheet).forEach(cell => {
+                  if (cell[0] === '!') {
+                    // Keep special properties but don't add !ref yet
+                    if (cell !== '!ref' && cell !== '!merges') {
+                         newCells[cell] = svpSheet[cell];
+                    }
+                    return;
+                  }
+                  
+                  const decoded = XLSX.utils.decode_cell(cell);
+                  if (decoded.r >= insertionPoint - 1) { // -1 because row numbers are 0-indexed
+                    // Shift this cell down
+                    const newRow = decoded.r + rowsNeeded;
+                    const newCell = XLSX.utils.encode_cell({ r: newRow, c: decoded.c });
+                    newCells[newCell] = svpSheet[cell];
+                    
+                    // Update formulas if they exist
+                    if (newCells[newCell].f) {
+                      // Simple formula update - shift row references
+                      newCells[newCell].f = newCells[newCell].f.replace(/([A-Z]+)(\d+)/g, (match, col, row) => {
+                        const rowNum = parseInt(row);
+                        if (rowNum >= insertionPoint) {
+                          return col + (rowNum + rowsNeeded);
+                        }
+                        return match;
+                      });
+                    }
+                  } else {
+                    // Keep cells before insertion point as-is
+                    newCells[cell] = svpSheet[cell];
+                  }
+                });
+                
+                // --- NEW FIX: HANDLE MERGED CELLS ---
+                if (svpSheet['!merges']) {
+                    const newMerges = [];
+                    svpSheet['!merges'].forEach(merge => {
+                        // If the merge block is below the insertion point, shift it down
+                        if (merge.s.r >= insertionPoint - 1) {
+                            newMerges.push({
+                                s: { r: merge.s.r + rowsNeeded, c: merge.s.c },
+                                e: { r: merge.e.r + rowsNeeded, c: merge.e.c }
+                            });
+                        } else {
+                            // If it's above, keep it as is
+                            newMerges.push(merge);
+                        }
+                    });
+                    newCells['!merges'] = newMerges;
+                }
+                // ------------------------------------
+                
+                // Update range
+                range.e.r += rowsNeeded;
+                newCells['!ref'] = XLSX.utils.encode_range(range);
+                
+                // Replace sheet cells
+                Object.keys(svpSheet).forEach(key => delete svpSheet[key]);
+                Object.assign(svpSheet, newCells);
+              }
+              
+              // Now insert header information (these cells are above data section)
+              const headerData = {
+                'B1': formData.jobNo ? `: ${formData.jobNo}` : '',
+                'B2': formData.project ? `: ${formData.project}` : '',
+                'B3': formData.client ? `: ${formData.client}` : '',
+                'B4': formData.dateTime ? `: ${formData.dateTime}` : '',
+                'E1': formData.area ? `: ${formData.area}` : '',
+                'E2': formData.location ? `: ${formData.location}` : '',
+                'E3': formData.vessel ? `: ${formData.vessel}` : '',
+                'E4': formData.instrument ? `: ${formData.instrument}` : ''
+              };
+              
+              Object.keys(headerData).forEach(cell => {
+                if (headerData[cell]) {
+                  svpSheet[cell] = { t: 's', v: headerData[cell] };
+                }
+              });
+
               // Insert downward data (columns A, B, C starting from row 8)
-              const downwardData = downward.map(row => [
-                parseFloat(row.depth).toFixed(2),
-                parseFloat(row.temperature).toFixed(2),
-                parseFloat(row.velocity).toFixed(2)
-              ]);
-              XLSX.utils.sheet_add_aoa(svpSheet, downwardData, { origin: 'A8' });
+              downward.forEach((row, idx) => {
+                const rowNum = TEMPLATE_DATA_START + idx;
+                svpSheet[`A${rowNum}`] = { t: 'n', v: parseFloat(row.depth), z: '0.00' };
+                svpSheet[`B${rowNum}`] = { t: 'n', v: parseFloat(row.temperature), z: '0.00' };
+                svpSheet[`C${rowNum}`] = { t: 'n', v: parseFloat(row.velocity), z: '0.00' };
+              });
 
               // Insert upward data (columns D, E, F starting from row 8)
-              const upwardData = upward.map(row => [
-                parseFloat(row.depth).toFixed(2),
-                parseFloat(row.temperature).toFixed(2),
-                parseFloat(row.velocity).toFixed(2)
-              ]);
-              XLSX.utils.sheet_add_aoa(svpSheet, upwardData, { origin: 'D8' });
+              upward.forEach((row, idx) => {
+                const rowNum = TEMPLATE_DATA_START + idx;
+                svpSheet[`D${rowNum}`] = { t: 'n', v: parseFloat(row.depth), z: '0.00' };
+                svpSheet[`E${rowNum}`] = { t: 'n', v: parseFloat(row.temperature), z: '0.00' };
+                svpSheet[`F${rowNum}`] = { t: 'n', v: parseFloat(row.velocity), z: '0.00' };
+              });
 
-              // Update formulas for the actual data range
-              const lastDataRow = 7 + maxRows;
-              
-              // Update formulas in row 47 (or last row + some offset)
-              const formulaRow = lastDataRow + 1;
-              
-              // AVERAGE formulas
-              svpSheet[`B${formulaRow}`] = { f: `AVERAGE(B8:B${lastDataRow})` };
-              svpSheet[`C${formulaRow}`] = { f: `AVERAGE(C8:C${lastDataRow})` };
-              svpSheet[`E${formulaRow}`] = { f: `AVERAGE(E8:E${lastDataRow})` };
-              svpSheet[`F${formulaRow}`] = { f: `AVERAGE(F8:F${lastDataRow})` };
-              
-              // MIN formulas
-              svpSheet[`B${formulaRow + 1}`] = { f: `MIN(B8:B${lastDataRow})` };
-              svpSheet[`C${formulaRow + 1}`] = { f: `MIN(C8:C${lastDataRow})` };
-              svpSheet[`E${formulaRow + 1}`] = { f: `MIN(E8:E${lastDataRow})` };
-              svpSheet[`F${formulaRow + 1}`] = { f: `MIN(F8:F${lastDataRow})` };
-              
-              // MAX formulas
-              svpSheet[`B${formulaRow + 2}`] = { f: `MAX(B8:B${lastDataRow})` };
-              svpSheet[`C${formulaRow + 2}`] = { f: `MAX(C8:C${lastDataRow})` };
-              svpSheet[`E${formulaRow + 2}`] = { f: `MAX(E8:E${lastDataRow})` };
-              svpSheet[`F${formulaRow + 2}`] = { f: `MAX(F8:F${lastDataRow})` };
-              
-              // STDEV formulas
-              svpSheet[`B${formulaRow + 3}`] = { f: `STDEV(B8:B${lastDataRow})` };
-              svpSheet[`C${formulaRow + 3}`] = { f: `STDEV(C8:C${lastDataRow})` };
-              svpSheet[`E${formulaRow + 3}`] = { f: `STDEV(E8:E${lastDataRow})` };
-              svpSheet[`F${formulaRow + 3}`] = { f: `STDEV(F8:F${lastDataRow})` };
-              
-              // Overall average (merged cell C51 to F51 equivalent)
-              svpSheet[`C${formulaRow + 4}`] = { f: `AVERAGE(C${formulaRow},F${formulaRow})` };
+              // Update formulas ONLY if data exceeds 39 rows
+              if (maxRows > TEMPLATE_DATA_ROWS) {
+                const actualFormulaRow = FORMULA_START_ROW + rowsNeeded;
+                const lastDataRow = TEMPLATE_DATA_START + maxRows - 1;
+                
+                // Update all formula cells with new ranges
+                // AVERAGE formulas (row 47 equivalent)
+                svpSheet[`B${actualFormulaRow}`] = { t: 'n', f: `AVERAGE(B${TEMPLATE_DATA_START}:B${lastDataRow})` };
+                svpSheet[`C${actualFormulaRow}`] = { t: 'n', f: `AVERAGE(C${TEMPLATE_DATA_START}:C${lastDataRow})` };
+                svpSheet[`E${actualFormulaRow}`] = { t: 'n', f: `AVERAGE(E${TEMPLATE_DATA_START}:E${lastDataRow})` };
+                svpSheet[`F${actualFormulaRow}`] = { t: 'n', f: `AVERAGE(F${TEMPLATE_DATA_START}:F${lastDataRow})` };
+                
+                // MIN formulas (row 48 equivalent)
+                svpSheet[`B${actualFormulaRow + 1}`] = { t: 'n', f: `MIN(B${TEMPLATE_DATA_START}:B${lastDataRow})` };
+                svpSheet[`C${actualFormulaRow + 1}`] = { t: 'n', f: `MIN(C${TEMPLATE_DATA_START}:C${lastDataRow})` };
+                svpSheet[`E${actualFormulaRow + 1}`] = { t: 'n', f: `MIN(E${TEMPLATE_DATA_START}:E${lastDataRow})` };
+                svpSheet[`F${actualFormulaRow + 1}`] = { t: 'n', f: `MIN(F${TEMPLATE_DATA_START}:F${lastDataRow})` };
+                
+                // MAX formulas (row 49 equivalent)
+                svpSheet[`B${actualFormulaRow + 2}`] = { t: 'n', f: `MAX(B${TEMPLATE_DATA_START}:B${lastDataRow})` };
+                svpSheet[`C${actualFormulaRow + 2}`] = { t: 'n', f: `MAX(C${TEMPLATE_DATA_START}:C${lastDataRow})` };
+                svpSheet[`E${actualFormulaRow + 2}`] = { t: 'n', f: `MAX(E${TEMPLATE_DATA_START}:E${lastDataRow})` };
+                svpSheet[`F${actualFormulaRow + 2}`] = { t: 'n', f: `MAX(F${TEMPLATE_DATA_START}:F${lastDataRow})` };
+                
+                // STDEV formulas (row 50 equivalent)
+                svpSheet[`B${actualFormulaRow + 3}`] = { t: 'n', f: `STDEV(B${TEMPLATE_DATA_START}:B${lastDataRow})` };
+                svpSheet[`C${actualFormulaRow + 3}`] = { t: 'n', f: `STDEV(C${TEMPLATE_DATA_START}:C${lastDataRow})` };
+                svpSheet[`E${actualFormulaRow + 3}`] = { t: 'n', f: `STDEV(E${TEMPLATE_DATA_START}:E${lastDataRow})` };
+                svpSheet[`F${actualFormulaRow + 3}`] = { t: 'n', f: `STDEV(F${TEMPLATE_DATA_START}:F${lastDataRow})` };
+                
+                // Overall average (merged cell C51 to F51 equivalent)
+                svpSheet[`C${actualFormulaRow + 4}`] = { t: 'n', f: `AVERAGE(C${actualFormulaRow},F${actualFormulaRow})` };
+              }
+              // If data <= 39 rows, formulas stay as-is in the template at rows 47-51
 
-              // Insert ALL raw data into RAW sheet (no processing)
+              // Insert ALL raw data into RAW sheet
               const rawSheet = workbook.Sheets['RAW'];
               
-              // Insert ALL unprocessed data starting from A1
-              const allRawData = validData.map(row => [
-                row.depth,
-                row.temperature,
-                row.velocity
-              ]);
-              XLSX.utils.sheet_add_aoa(rawSheet, allRawData, { origin: 'A1' });
-
-              // Update sheet range to include all data
-              const svpRange = XLSX.utils.decode_range(svpSheet['!ref']);
-              svpRange.e.r = Math.max(svpRange.e.r, formulaRow + 4);
-              svpSheet['!ref'] = XLSX.utils.encode_range(svpRange);
+              // Clear existing data in RAW sheet first
+              Object.keys(rawSheet).forEach(key => {
+                if (key[0] !== '!') {
+                  delete rawSheet[key];
+                }
+              });
               
-              const rawRange = XLSX.utils.decode_range(rawSheet['!ref']);
-              rawRange.e.r = Math.max(rawRange.e.r, 7 + allRawData.length);
-              rawSheet['!ref'] = XLSX.utils.encode_range(rawRange);
+              // Insert ALL unprocessed data starting from A1
+              validData.forEach((row, idx) => {
+                const rowNum = idx + 1;
+                rawSheet[`A${rowNum}`] = { t: 'n', v: parseFloat(row.depth || row.depth), z: '0.00' };
+                rawSheet[`B${rowNum}`] = { t: 'n', v: parseFloat(row.temperature || row.temperature), z: '0.00' };
+                rawSheet[`C${rowNum}`] = { t: 'n', v: parseFloat(row.velocity || row.velocity), z: '0.00' };
+              });
+              
+              // Update RAW sheet range
+              rawSheet['!ref'] = `A1:C${validData.length}`;
 
               // Generate and download file
-              XLSX.writeFile(workbook, `SVP_${formData.jobNo || 'Data'}_${new Date().toISOString().split('T')[0]}.xlsx`);
+              XLSX.writeFile(workbook, `SVP_${formData.jobNo || 'Data'}_${new Date().toISOString().split('T')[0]}.xlsx`, { cellStyles: true });
               
-              alert('Excel file generated successfully with all formulas preserved!');
+              alert(`Excel file generated successfully!\nData rows: ${maxRows}\nDownward: ${downward.length}, Upward: ${upward.length}\nTemplate formatting preserved!`);
             } catch (error) {
               console.error('Error generating Excel:', error);
               alert(`Error generating Excel file: ${error.message}. Make sure the template is accessible on GitHub.`);
